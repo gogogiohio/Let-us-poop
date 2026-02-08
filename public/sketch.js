@@ -1,449 +1,368 @@
-// ============================
-//  Poop Sheep (Deploy-ready)
-//  - iOS-friendly permission UX
-//  - Detects sensor availability & guides user
-//  - socket.io broadcast for multiplayer
-// ============================
-
+// Socket
 const socket = io();
 
-// ---------- UI ----------
-let overlay, titleEl, statusEl, hintEl, startBtn;
+let canvas;
+let poopLayer; // poop drawing layer
+let gameStarted = false; // whether the game started
 
-// ---------- Sensor ----------
-let beta = 0, gamma = 0;
-let betaSmooth = 0, gammaSmooth = 0;
-let permissionState = "idle"; // idle | requesting | granted | denied | unsupported
-let gotSensorData = false;
-let firstDataMs = null;
-let lastDataMs = null;
+// iOS permission flag (boolean)
+let askButton;
 
-// ---------- Sheep physics ----------
-let sheep = { x: 0, y: 0, vx: 0, vy: 0, heading: 0 };
+// deviceorientation values
+let beta = 0;
+let gamma = 0;
+let betaSmooth = 0;
+let gammaSmooth = 0;
 
+// my sheep
+let mySheepX, mySheepY;
+let prevX, prevY;
+
+// other players' sheep
+let otherSheeps = {};
+
+// my grayscale color
+let myGray;
+
+// tuning
 const DEAD_ZONE = 6;
 const MAX_TILT = 35;
-const ACC = 0.35;
-const FRICTION = 0.90;
-const BOUNCE = 0.55;
+const SHEEP_SPEED = 8;
+const SMOOTHING = 0.15;
 
-// ---------- Poop ----------
-let poops = [];
-const POOP_MAX = 2500;
+// socket throttle
+let lastEmitMs = 0;
 
-const POOP_RATE = 0.18;
-const POOP_MIN_SPEED = 0.25;
-let poopAccumulator = 0;
-
-// ---------- Networking ----------
-let lastStateEmitMs = 0;
-const STATE_EMIT_MS = 40;
+// --------- Sensor data watchdog (NO visual changes, English alerts only) ---------
+let gotOrientationData = false;
+let orientationDataStartMs = 0;
+let noDataAlerted = false;
+// -----------------------------------------------------------------------------
 
 function setup() {
-  createCanvas(windowWidth, windowHeight);
-  noStroke();
+  canvas = createCanvas(windowWidth, windowHeight);
+  canvas.parent("sketch-container");
+
+  // Create poop layer
+  poopLayer = createGraphics(windowWidth, windowHeight);
+  poopLayer.background(255);
+
+  // Hide GUI container (keep your original behavior)
+  let gui = select("#gui-container");
+  if (gui) gui.style("display", "none");
+
   background(255);
 
-  sheep.x = width / 2;
-  sheep.y = height / 2;
+  // Init my sheep position
+  mySheepX = width / 2;
+  mySheepY = height / 2;
+  prevX = mySheepX;
+  prevY = mySheepY;
 
-  buildOverlay();
+  // Assign grayscale (avoid too light)
+  myGray = int(random(4)) * 40;
 
-  // Multiplayer receive
-  socket.on("drawing", (msg) => {
-    if (!msg || !msg.kind) return;
-
-    if (msg.kind === "state") {
-      drawRemoteSheep(msg.x * width, msg.y * height, msg.heading);
-    } else if (msg.kind === "poop") {
-      addPoop(msg.x * width, msg.y * height, msg.r, msg.seed);
-    } else if (msg.kind === "clear") {
-      clearAll(false);
-    }
-  });
-
-  // If browser doesn’t support deviceorientation at all
-  if (typeof window.DeviceOrientationEvent === "undefined") {
-    permissionState = "unsupported";
-    setOverlayState();
-  } else {
-    setOverlayState();
-  }
+  initMotionPermissionUI();
 }
 
 function draw() {
-  // Always run visuals; even denied shows instructions
-  // Soft fade to keep trails
-  fill(255, 255, 255, 18);
-  rect(0, 0, width, height);
+  // Start screen (keep visuals)
+  if (!gameStarted) {
+    drawStartScreen();
+    return;
+  }
 
-  // Update poop visuals
-  updatePoops();
+  // Clear main canvas
+  background(255);
 
-  // If we have permission + sensor data, move sheep
-  if (permissionState === "granted" && gotSensorData) {
-    betaSmooth = lerp(betaSmooth, beta, 0.12);
-    gammaSmooth = lerp(gammaSmooth, gamma, 0.12);
+  // Smooth sensor
+  betaSmooth = lerp(betaSmooth, beta, SMOOTHING);
+  gammaSmooth = lerp(gammaSmooth, gamma, SMOOTHING);
 
-    const nx = normTilt(gammaSmooth);
-    const ny = normTilt(betaSmooth);
+  // Tilt -> velocity
+  const vx = map(
+    constrain(gammaSmooth, -MAX_TILT, MAX_TILT),
+    -MAX_TILT,
+    MAX_TILT,
+    -SHEEP_SPEED,
+    SHEEP_SPEED
+  );
+  const vy = map(
+    constrain(betaSmooth, -MAX_TILT, MAX_TILT),
+    -MAX_TILT,
+    MAX_TILT,
+    -SHEEP_SPEED,
+    SHEEP_SPEED
+  );
 
-    sheep.vx = (sheep.vx + nx * ACC) * FRICTION;
-    sheep.vy = (sheep.vy + ny * ACC) * FRICTION;
+  // Move my sheep
+  mySheepX = constrain(mySheepX + vx, 30, width - 30);
+  mySheepY = constrain(mySheepY + vy, 30, height - 30);
 
-    sheep.x += sheep.vx;
-    sheep.y += sheep.vy;
+  // Movement strength
+  const mag = sqrt(vx * vx + vy * vy);
+  const isMoving = mag > 0.5;
 
-    const speed = Math.hypot(sheep.vx, sheep.vy);
-    if (speed > 0.05) sheep.heading = Math.atan2(sheep.vy, sheep.vx);
+  // Poop while moving (reduced amount)
+  if (isMoving && frameCount % 2 === 0) {
+    const poopCount = 1;
 
-    if (sheep.x < 0) { sheep.x = 0; sheep.vx *= -BOUNCE; }
-    if (sheep.y < 0) { sheep.y = 0; sheep.vy *= -BOUNCE; }
-    if (sheep.x > width) { sheep.x = width; sheep.vx *= -BOUNCE; }
-    if (sheep.y > height) { sheep.y = height; sheep.vy *= -BOUNCE; }
+    for (let i = 0; i < poopCount; i++) {
+      const size = random(10, 16);
+      const angle = atan2(vy, vx) + PI;
+      const spread = random(15, 25);
+      const offsetAngle = angle + random(-0.4, 0.4);
 
-    // Spawn poop behind sheep
-    if (speed > POOP_MIN_SPEED) {
-      poopAccumulator += speed * POOP_RATE;
-      while (poopAccumulator >= 1) {
-        poopAccumulator -= 1;
+      const poopX = mySheepX + cos(offsetAngle) * spread + random(-8, 8);
+      const poopY = mySheepY + sin(offsetAngle) * spread + random(-8, 8);
 
-        const back = -sheep.heading;
-        const bx = sheep.x + Math.cos(back) * 18 + random(-4, 4);
-        const by = sheep.y + Math.sin(back) * 18 + random(-4, 4);
-        const r = random(3, 8);
-        const seed = floor(random(1e9));
+      poopLayer.fill(myGray);
+      poopLayer.noStroke();
+      poopLayer.ellipse(poopX, poopY, size, size);
 
-        addPoop(bx, by, r, seed);
-
-        socket.emit("drawing", {
-          kind: "poop",
-          x: bx / width,
-          y: by / height,
-          r,
-          seed
-        });
-      }
-    }
-
-    // Draw sheep
-    drawSheep(sheep.x, sheep.y, sheep.heading, 1.0);
-
-    // Emit state
-    const now = millis();
-    if (now - lastStateEmitMs > STATE_EMIT_MS) {
-      socket.emit("drawing", {
-        kind: "state",
-        x: sheep.x / width,
-        y: sheep.y / height,
-        heading: sheep.heading
-      });
-      lastStateEmitMs = now;
-    }
-
-    // Status update (small + not spammy)
-    if (frameCount % 20 === 0) setOverlayState();
-  } else {
-    // Still draw sheep idle
-    drawSheep(sheep.x, sheep.y, sheep.heading, 1.0);
-
-    // After user clicked start, if we still get no data in 2s, show targeted hints
-    if (permissionState === "granted" && !gotSensorData) {
+      // Broadcast poop (throttle)
       const now = millis();
-      if (firstDataMs == null && now > 2000) {
-        // still no data
-        hintEl.html(
-          [
-            "权限看起来通过了，但 Safari 没有给传感器数据。最常见原因：",
-            "1) iPhone 设置 → Safari → Advanced → <b>Motion & Orientation Access</b> 没打开",
-            "2) 这个域名之前被拒绝过：设置 → Safari → Advanced → Website Data → 删除本网站数据后重试",
-            "3) 不是 Safari 打开（从 App 内置浏览器打开会失败）"
-          ].join("<br/>")
-        );
+      if (now - lastEmitMs > 50) {
+        socket.emit("poop", {
+          x: poopX / width,
+          y: poopY / height,
+          size: size,
+          gray: myGray
+        });
+        lastEmitMs = now;
       }
     }
   }
+
+  prevX = mySheepX;
+  prevY = mySheepY;
+
+  // Draw poop layer
+  image(poopLayer, 0, 0);
+
+  // Draw other sheep
+  for (let id in otherSheeps) {
+    let sheep = otherSheeps[id];
+    drawPixelSheep(sheep.x, sheep.y);
+  }
+
+  // Draw my sheep
+  drawPixelSheep(mySheepX, mySheepY);
+
+  // HUD (keep your original style)
+  fill(0);
+  noStroke();
+  textSize(16);
+  textFont("monospace");
+  text("SHEEP: " + (Object.keys(otherSheeps).length + 1), 15, 25);
+
+  // My grayscale
+  fill(myGray);
+  rect(15, 35, 20, 20);
+  fill(0);
+  text("ME", 40, 50);
+
+  // Send my position (separate throttle)
+  const now = millis();
+  if (now - lastEmitMs > 100) {
+    socket.emit("position", {
+      id: socket.id,
+      x: mySheepX,
+      y: mySheepY,
+      gray: myGray
+    });
+    lastEmitMs = now;
+  }
 }
 
-// ============================
-// Sensor / Permission UX
-// ============================
-function buildOverlay() {
-  overlay = createDiv("");
-  overlay.style("position", "fixed");
-  overlay.style("left", "0");
-  overlay.style("top", "0");
-  overlay.style("width", "100%");
-  overlay.style("height", "100%");
-  overlay.style("display", "flex");
-  overlay.style("align-items", "center");
-  overlay.style("justify-content", "center");
-  overlay.style("background", "rgba(255,255,255,0.92)");
-  overlay.style("backdrop-filter", "blur(10px)");
-  overlay.style("z-index", "9999");
-  overlay.style("padding", "22px");
-  overlay.style("box-sizing", "border-box");
+// --------------------
+// Start screen (KEEP VISUALS)
+// --------------------
+function drawStartScreen() {
+  background(255);
 
-  const card = createDiv("");
-  card.parent(overlay);
-  card.style("max-width", "560px");
-  card.style("width", "100%");
-  card.style("background", "white");
-  card.style("border-radius", "18px");
-  card.style("box-shadow", "0 18px 60px rgba(0,0,0,0.14)");
-  card.style("padding", "18px 18px 16px");
+  push();
+  translate(width / 2, height / 2 - 50);
 
-  titleEl = createDiv("🐑💩 Poop Sheep");
-  titleEl.parent(card);
-  titleEl.style("font-family", "system-ui");
-  titleEl.style("font-weight", "800");
-  titleEl.style("font-size", "18px");
-  titleEl.style("margin-bottom", "8px");
+  fill(0);
+  noStroke();
+  textAlign(CENTER, CENTER);
+  textSize(48);
+  textFont("monospace");
+  textStyle(BOLD);
+  text("LET'S POOP", 0, 0);
 
-  statusEl = createDiv("");
-  statusEl.parent(card);
-  statusEl.style("font-family", "system-ui");
-  statusEl.style("font-size", "14px");
-  statusEl.style("line-height", "1.35");
-  statusEl.style("margin-bottom", "10px");
+  if (frameCount % 60 < 30) {
+    translate(0, 80);
+    drawPixelSheep(0, 0);
+  }
 
-  hintEl = createDiv("");
-  hintEl.parent(card);
-  hintEl.style("font-family", "system-ui");
-  hintEl.style("font-size", "13px");
-  hintEl.style("line-height", "1.4");
-  hintEl.style("opacity", "0.8");
-  hintEl.style("margin-bottom", "12px");
+  pop();
 
-  startBtn = createButton("Start / Enable Motion");
-  startBtn.parent(card);
-  startBtn.style("width", "100%");
-  startBtn.style("height", "46px");
-  startBtn.style("border", "none");
-  startBtn.style("border-radius", "14px");
-  startBtn.style("font-size", "16px");
-  startBtn.style("font-weight", "700");
-  startBtn.style("cursor", "pointer");
-  startBtn.mousePressed(requestMotionPermission);
-
-  const small = createDiv("Tip: 如果你刚刚点了拒绝，需要在 iPhone 设置里把本网站的权限清掉再来。");
-  small.parent(card);
-  small.style("font-family", "system-ui");
-  small.style("font-size", "12px");
-  small.style("opacity", "0.6");
-  small.style("margin-top", "10px");
-
-  setOverlayState();
+  fill(100);
+  textAlign(CENTER, CENTER);
+  textSize(16);
+  textFont("monospace");
+  text("CLICK TO START", width / 2, height - 100);
 }
 
-function setOverlayState() {
-  if (permissionState === "unsupported") {
-    statusEl.html("你的浏览器不支持 DeviceOrientation（陀螺仪方向事件）。请用 iPhone Safari 或 Chrome Android。");
-    hintEl.html("如果你在某个 App 内置浏览器里打开，请复制链接到 Safari 打开。");
-    startBtn.attribute("disabled", "");
-    return;
-  }
+// --------------------
+// Click to start (permission first on iOS)
+// --------------------
+function mousePressed() {
+  if (gameStarted) return;
 
-  if (permissionState === "idle") {
-    statusEl.html("点击下方按钮开始。需要使用手机的陀螺仪来控制小羊移动并拉屎。");
-    hintEl.html("iPhone 必须点按钮才会弹出系统授权框。<br/>如果弹框里有 Allow，请点 Allow。");
-    startBtn.removeAttribute("disabled");
-    overlay.style("display", "flex");
-    return;
+  if (askButton) {
+    requestMotionPermission();
+  } else {
+    gameStarted = true;
   }
+}
 
-  if (permissionState === "requesting") {
-    statusEl.html("正在请求权限…如果系统弹框出现，请选择 Allow。");
-    hintEl.html("如果你点了拒绝，Safari 会记住，需要去设置里清掉权限后再试。");
-    startBtn.attribute("disabled", "");
-    overlay.style("display", "flex");
-    return;
-  }
+// --------------------
+// Pixel sheep (KEEP VISUALS)
+// --------------------
+function drawPixelSheep(x, y) {
+  push();
+  translate(x, y);
 
-  if (permissionState === "denied") {
-    statusEl.html("❌ Permission Denied（系统拒绝了运动/方向访问）");
-    hintEl.html(
-      [
-        "请按以下任意一种方式修复：",
-        "1) iPhone 设置 → Safari → Advanced → <b>Motion & Orientation Access</b> 打开",
-        "2) iPhone 设置 → Safari → Advanced → Website Data → 删除 <b>let-us-poop-io.onrender.com</b> 的数据",
-        "3) 确保用 Safari 打开（不要在微信/QQ内置浏览器里）"
-      ].join("<br/>")
-    );
-    startBtn.removeAttribute("disabled");
-    startBtn.html("Try Again");
-    overlay.style("display", "flex");
-    return;
-  }
+  const s = 28;
 
-  if (permissionState === "granted") {
-    // Hide overlay once we actually receive sensor data (safer than hiding immediately)
-    if (gotSensorData) {
-      overlay.style("display", "none");
-    } else {
-      statusEl.html("✅ 权限已通过。等待陀螺仪数据…（请轻轻旋转手机）");
-      hintEl.html("如果 2 秒内数据仍然是 0，通常是 Safari 全局 Motion 开关没开。");
-      overlay.style("display", "flex");
-    }
-    return;
+  // wool
+  fill(255);
+  stroke(0);
+  strokeWeight(2);
+  rect(-s / 2, -s / 3, s, s / 1.5);
+
+  // head
+  fill(255);
+  rect(s / 3, -s / 3, s / 2.5, s / 1.8);
+
+  // eyes
+  fill(0);
+  noStroke();
+  rect(s / 3 + 2, -s / 5, 3, 3);
+  rect(s / 3 + s / 5, -s / 5, 3, 3);
+
+  // legs
+  rect(-s / 3, s / 4, 4, s / 3);
+  rect(-s / 6, s / 4, 4, s / 3);
+  rect(s / 12, s / 4, 4, s / 3);
+  rect(s / 4, s / 4, 4, s / 3);
+
+  pop();
+}
+
+// --------------------
+// Motion permission (NO VISUAL CHANGES, ENGLISH ALERTS ONLY)
+// --------------------
+function initMotionPermissionUI() {
+  const needsPermission =
+    typeof DeviceOrientationEvent !== "undefined" &&
+    typeof DeviceOrientationEvent.requestPermission === "function";
+
+  if (needsPermission) {
+    askButton = true;
+    // Stay on start screen until user clicks and permission granted.
+  } else {
+    window.addEventListener("deviceorientation", onDeviceOrientation, true);
+    gameStarted = true;
   }
 }
 
 async function requestMotionPermission() {
-  permissionState = "requesting";
-  gotSensorData = false;
-  firstDataMs = null;
-  lastDataMs = null;
-  setOverlayState();
-
   try {
-    // iOS 13+: must request permission via user gesture
-    if (typeof DeviceOrientationEvent !== "undefined" &&
-        typeof DeviceOrientationEvent.requestPermission === "function") {
-      const res = await DeviceOrientationEvent.requestPermission();
-      if (res !== "granted") {
-        permissionState = "denied";
-        setOverlayState();
-        return;
-      }
+    // reset watchdog
+    gotOrientationData = false;
+    noDataAlerted = false;
+    orientationDataStartMs = millis();
+
+    const res = await DeviceOrientationEvent.requestPermission();
+    if (res !== "granted") {
+      alert(
+        "Permission denied.\n\n" +
+          "Fix on iPhone:\n" +
+          "1) Settings → Safari → Advanced → Motion & Orientation Access → ON\n" +
+          "2) Or: Settings → Safari → Advanced → Website Data → delete this site\n" +
+          "Then reload and try again."
+      );
+      gameStarted = false;
+      return;
     }
 
-    // Some iOS versions also gate devicemotion separately, but we only NEED orientation.
-    // Add listener now:
     window.addEventListener("deviceorientation", onDeviceOrientation, true);
 
-    permissionState = "granted";
-    startBtn.attribute("disabled", "");
-    startBtn.html("Enabled ✅");
-    setOverlayState();
-  } catch (e) {
-    // If Safari global motion access is OFF, it often throws / denies here
-    console.error(e);
-    permissionState = "denied";
-    setOverlayState();
+    // Start the game ONLY after permission granted
+    gameStarted = true;
+
+    // If permission is granted but Safari provides no data, alert once after 2s
+    setTimeout(() => {
+      if (gameStarted && !gotOrientationData && !noDataAlerted) {
+        noDataAlerted = true;
+        alert(
+          "Motion permission looks granted, but no sensor data is coming through.\n\n" +
+            "Most common fixes on iPhone:\n" +
+            "1) Settings → Safari → Advanced → Motion & Orientation Access → ON\n" +
+            "2) Settings → Safari → Advanced → Website Data → delete this site\n" +
+            "3) Make sure you opened the link in Safari (not an in-app browser)\n\n" +
+            "Reload the page and try again."
+        );
+      }
+    }, 2000);
+  } catch (err) {
+    console.error(err);
+    alert(
+      "Permission error.\n\n" +
+        "Open this link in Safari (not an in-app browser), and check:\n" +
+        "Settings → Safari → Advanced → Motion & Orientation Access."
+    );
+    gameStarted = false;
   }
 }
 
 function onDeviceOrientation(e) {
-  // If Safari is actually providing data, beta/gamma will be numbers
-  if (typeof e.beta === "number" && typeof e.gamma === "number") {
-    beta = e.beta;
-    gamma = e.gamma;
+  if (e.beta == null || e.gamma == null) return;
 
-    lastDataMs = millis();
-    if (!gotSensorData) {
-      gotSensorData = true;
-      firstDataMs = lastDataMs;
-      setOverlayState();
-    }
-  }
+  // mark that we have real sensor data
+  if (!gotOrientationData) gotOrientationData = true;
+
+  beta = e.beta;
+  gamma = e.gamma;
 }
 
-// ============================
-// Poop + Sheep drawing
-// ============================
-function normTilt(v) {
-  const s = Math.sign(v);
-  const a = Math.abs(v);
-  if (a < DEAD_ZONE) return 0;
-  const t = Math.min((a - DEAD_ZONE) / (MAX_TILT - DEAD_ZONE), 1);
-  return s * t;
-}
+// --------------------
+// Socket (KEEP YOUR PROTOCOL)
+// --------------------
+socket.on("poop", (data) => {
+  poopLayer.fill(data.gray);
+  poopLayer.noStroke();
+  poopLayer.ellipse(data.x * width, data.y * height, data.size, data.size);
+});
 
-function addPoop(x, y, r, seed) {
-  randomSeed(seed || 1);
-  poops.push({
-    x, y, r,
-    a: random(150, 230),
-    wob: random(1000),
-    life: 1.0
-  });
-  if (poops.length > POOP_MAX) poops.splice(0, poops.length - POOP_MAX);
-}
+socket.on("position", (data) => {
+  if (data.id === socket.id) return;
+  otherSheeps[data.id] = {
+    x: data.x,
+    y: data.y,
+    gray: data.gray
+  };
+});
 
-function updatePoops() {
-  for (let i = Math.max(0, poops.length - 1500); i < poops.length; i++) {
-    const p = poops[i];
-    p.life *= 0.9992;
-    p.a *= 0.9995;
+socket.on("disconnect", () => {
+  console.log("disconnected");
+});
 
-    const rr = p.r * (0.7 + 0.3 * p.life);
-    const jx = (noise(p.wob + frameCount * 0.01) - 0.5) * 0.6;
-    const jy = (noise(p.wob + 999 + frameCount * 0.01) - 0.5) * 0.6;
-
-    fill(25, 160);
-    ellipse(p.x + jx, p.y + jy + 1, rr * 1.05, rr * 0.9);
-
-    fill(70, 45, 20, p.a);
-    ellipse(p.x + jx, p.y + jy, rr, rr * 0.85);
-
-    fill(255, 255, 255, 18);
-    ellipse(p.x + jx - rr * 0.18, p.y + jy - rr * 0.12, rr * 0.22, rr * 0.18);
-  }
-}
-
-function drawSheep(x, y, heading, scaleMul) {
-  push();
-  translate(x, y);
-  rotate(heading);
-
-  const s = 1.0 * scaleMul;
-
-  fill(40);
-  rect(-10 * s, 12 * s, 6 * s, 14 * s, 3 * s);
-  rect(6 * s, 12 * s, 6 * s, 14 * s, 3 * s);
-
-  fill(245);
-  ellipse(0, 0, 46 * s, 34 * s);
-  ellipse(-12 * s, -4 * s, 26 * s, 22 * s);
-  ellipse(12 * s, -5 * s, 26 * s, 22 * s);
-
-  fill(60);
-  ellipse(26 * s, -6 * s, 20 * s, 18 * s);
-
-  fill(230);
-  ellipse(29 * s, -6 * s, 10 * s, 10 * s);
-
-  fill(0);
-  ellipse(28 * s, -8 * s, 2.6 * s, 2.6 * s);
-  ellipse(32 * s, -8 * s, 2.6 * s, 2.6 * s);
-
-  fill(50);
-  ellipse(22 * s, -14 * s, 10 * s, 6 * s);
-
-  fill(240);
-  ellipse(-24 * s, -2 * s, 10 * s, 10 * s);
-
-  pop();
-}
-
-function drawRemoteSheep(x, y, heading) {
-  // ghosty presence
-  push();
-  fill(255, 255, 255, 10);
-  rect(0, 0, width, height);
-  pop();
-  drawSheep(x, y, heading, 0.92);
-}
-
-// ============================
-// Utilities
-// ============================
+// --------------------
+// Resizing / mobile
+// --------------------
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  poopLayer = createGraphics(windowWidth, windowHeight);
+  poopLayer.background(255);
+  mySheepX = width / 2;
+  mySheepY = height / 2;
 }
 
 function touchMoved() {
   return false;
-}
-
-function doubleClicked() {
-  clearAll(true);
-}
-
-function clearAll(broadcast) {
-  background(255);
-  poops = [];
-  poopAccumulator = 0;
-  if (broadcast) socket.emit("drawing", { kind: "clear" });
 }
