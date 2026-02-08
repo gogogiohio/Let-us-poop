@@ -1,0 +1,21 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #ffffff;
+  font-family: monospace;
+}
+
+canvas {
+  display: block;
+}
+
+#sketch-container {
+  position: fixed;
+  inset: 0;
+}
+
+#gui-container {
+  display: none;
+}
