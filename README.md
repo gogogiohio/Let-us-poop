@@ -7,10 +7,14 @@ This project is a browser-based interactive artwork where users control a pixel 
 The experience is designed primarily for mobile devices (iOS Safari recommended).
 
 # How to use
+
 PC
+
 $ npm install
 $ node app.js
+
 MC
+
 https://let-us-poop-io.onrender.com
 
 # Technologies Used
