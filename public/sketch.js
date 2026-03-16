@@ -1,3 +1,6 @@
+//Name: LET US POOP
+//Date: March 2026
+//Author: Zhang Yuxin (Giogio) and Lexin Li (Lexin)
 // Socket
 const socket = io();
 
