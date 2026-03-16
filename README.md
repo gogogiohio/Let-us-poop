@@ -1,5 +1,9 @@
 # Let us poop 🐑💩
+Name: LET US POOP
+Date: March 2026
+Author: Zhang Yuxin (Giogio) and Lexin Li (Lexin)
 
+# Instructions
 A real-time, motion-controlled multiplayer drawing experiment
 
 This project is a browser-based interactive artwork where users control a pixel sheep using device motion (tilt). Movement leaves behind “poop” traces on a shared canvas, synchronized in real time across all connected users via Socket.IO.
